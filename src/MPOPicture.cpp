@@ -1,5 +1,5 @@
 /*
- *  Copyright (C) 2005-2021 Team Kodi
+ *  Copyright (C) 2005-2026 Team Kodi
  *  https://kodi.tv
  *
  *  SPDX-License-Identifier: GPL-2.0-or-later
@@ -12,16 +12,14 @@
 
 #include <csetjmp>
 #include <iostream>
+#include <algorithm>
+#include <cstring>
+#include <vector>
 #include <kodi/Filesystem.h>
 
 namespace
 {
 
-// libjpeg's default error_exit calls exit(), and libmpo installs it via
-// jpeg_std_error() without overriding it, so a malformed file terminates Kodi
-// rather than failing the decode. mpo_decompress_error_exit() can only replace
-// the function pointer, not attach state to it, so the jump target is
-// thread-local; each decoder instance is driven from one thread at a time.
 thread_local std::jmp_buf s_jpegEscape;
 
 void MpoFatalError(j_common_ptr cinfo)
@@ -120,7 +118,7 @@ bool MPOPicture::ReadTag(const std::string& file, kodi::addon::ImageDecoderInfoT
     tm.tm_hour = atoi(dateTime.substr(11, 2).c_str());
     tm.tm_min = atoi(dateTime.substr(14, 2).c_str());
     tm.tm_sec = atoi(dateTime.substr(17, 2).c_str());
-    tm.tm_isdst = -1; // Assume local daylight setting per date/time
+    tm.tm_isdst = -1;
     tag.SetTimeCreated(mktime(&tm));
   }
   tag.SetDistance(imageEXIF.SubjectDistance);
@@ -163,7 +161,6 @@ bool MPOPicture::LoadImageFromMemory(const std::string& mimetype,
                                      unsigned int& width,
                                      unsigned int& height)
 {
-  // make a copy of data as we need it at decode time.
   m_data.resize(bufSize);
   std::copy(buffer, buffer + bufSize, m_data.begin());
   mpo_create_decompress(&m_mpoinfo);
@@ -182,8 +179,10 @@ bool MPOPicture::LoadImageFromMemory(const std::string& mimetype,
   }
   m_allocated = true;
   m_images = mpo_get_number_images(&m_mpoinfo);
-  m_width = width = m_mpoinfo.cinfo.cinfo.image_width * m_images;
-  m_height = height = m_mpoinfo.cinfo.cinfo.image_height;
+
+  // Zwinge das Ausgabebild fest auf 1920x1080 (Full HD Half-SBS)
+  m_width = width = 1920;
+  m_height = height = 1080;
 
   return true;
 }
@@ -195,8 +194,6 @@ bool MPOPicture::Decode(uint8_t* pixels,
                         unsigned int pitch,
                         ADDON_IMG_FMT format)
 {
-  // The copy loop below writes B,G,R and only fills the fourth byte for
-  // A8R8G8B8, so that is the only format implemented here.
   if (format != ADDON_IMG_FMT_A8R8G8B8)
   {
     kodi::Log(ADDON_LOG_ERROR, "%s: Unsupported target format (%d)", __func__,
@@ -207,49 +204,80 @@ bool MPOPicture::Decode(uint8_t* pixels,
   if (setjmp(s_jpegEscape))
     return false;
 
+  // Initialisiere das Ziel-Canvas komplett mit Schwarz (0x00)
+  std::memset(pixels, 0, pixelBufferSize);
+
   size_t image = 0;
-  while (image < m_images)
+  while (image < m_images && image < 2) // Wir verarbeiten max. 2 Augen (3D)
   {
     mpo_start_decompress(&m_mpoinfo);
-    JSAMPARRAY buffer;
-    int row_stride = m_mpoinfo.cinfo.cinfo.output_width * m_mpoinfo.cinfo.cinfo.output_components;
+    
+    int srcW = m_mpoinfo.cinfo.cinfo.output_width;
+    int srcH = m_mpoinfo.cinfo.cinfo.output_height;
+    int row_stride = srcW * m_mpoinfo.cinfo.cinfo.output_components;
 
-    // Mirrors the destination offset in the loop below exactly - the integer
-    // division must be applied in the same order or an odd m_width
-    // underestimates the reach for images after the first.
-    const size_t tileOffset = image * m_width / 2 * 4;
-    if (m_height == 0 || row_stride <= 0 ||
-        static_cast<size_t>(m_height - 1) * pitch + tileOffset +
-                static_cast<size_t>(row_stride / 3) * 4 >
-            pixelBufferSize)
-    {
-      kodi::Log(ADDON_LOG_ERROR, "%s: Output buffer too small for image %zu of %ux%u at pitch %u",
-                __func__, image, m_width, m_height, pitch);
-      mpo_finish_decompress(&m_mpoinfo);
-      return false;
-    }
-
+    // Lese alle Scanlines des Quellbildes in einen temporären Puffer
+    std::vector<uint8_t> eyeBuffer(srcW * srcH * 3);
     size_t lines = 0;
-    while (lines < m_height)
+    while (lines < static_cast<size_t>(srcH))
     {
-      buffer = (*m_mpoinfo.cinfo.cinfo.mem->alloc_sarray)((j_common_ptr)&m_mpoinfo.cinfo,
-                                                          JPOOL_IMAGE, row_stride, m_height);
-      size_t nl = mpo_read_scanlines(&m_mpoinfo, buffer, m_height - lines);
-      for (size_t line = 0; line < nl; ++line)
+      JSAMPARRAY buffer = (*m_mpoinfo.cinfo.cinfo.mem->alloc_sarray)(
+          (j_common_ptr)&m_mpoinfo.cinfo, JPOOL_IMAGE, row_stride, srcH);
+      size_t nl = mpo_read_scanlines(&m_mpoinfo, buffer, srcH - lines);
+      for (size_t l = 0; l < nl; ++l)
       {
-        unsigned char* dst = pixels + (line + lines) * pitch + image * m_width / 2 * 4;
-        for (size_t i = 0; i < row_stride; i += 3)
-        {
-          *dst++ = buffer[line][i + 2];
-          *dst++ = buffer[line][i + 1];
-          *dst++ = buffer[line][i];
-          if (format == ADDON_IMG_FMT_A8R8G8B8)
-            *dst++ = 0xff;
-        }
+        std::memcpy(eyeBuffer.data() + (lines + l) * row_stride, buffer[l], row_stride);
       }
       lines += nl;
     }
     mpo_finish_decompress(&m_mpoinfo);
+
+    // Berechne Half-SBS Stauchung & Zentrierung (Pillarbarmatching)
+    float scaleY = static_cast<float>(height) / srcH;
+    int propWidth = static_cast<int>(srcW * scaleY);
+    int targetEyeWidth = std::min(propWidth / 2, static_cast<int>(width / 2));
+    int marginX = (width / 2 - targetEyeWidth) / 2;
+    int offsetX = (image == 1 ? (width / 2) : 0) + marginX;
+
+    // Bilineares Downsampling direkt in Kodis Zielpuffer (BGRA / A8R8G8B8)
+    for (unsigned int y = 0; y < height; ++y)
+    {
+      float srcY = y / scaleY;
+      int y0 = static_cast<int>(srcY);
+      int y1 = std::min(y0 + 1, srcH - 1);
+      float dy = srcY - y0;
+
+      for (int x = 0; x < targetEyeWidth; ++x)
+      {
+        float srcX = x * (static_cast<float>(srcW) / targetEyeWidth);
+        int x0 = static_cast<int>(srcX);
+        int x1 = std::min(x0 + 1, srcW - 1);
+        float dx = srcX - x0;
+
+        int dstX = offsetX + x;
+        uint8_t* dst = pixels + y * pitch + dstX * 4;
+
+        // Sample RGB Kanäle aus dem Quell-Eye
+        for (int c = 0; c < 3; ++c)
+        {
+          float p00 = eyeBuffer[(y0 * srcW + x0) * 3 + c];
+          float p10 = eyeBuffer[(y0 * srcW + x1) * 3 + c];
+          float p01 = eyeBuffer[(y1 * srcW + x0) * 3 + c];
+          float p11 = eyeBuffer[(y1 * srcW + x1) * 3 + c];
+
+          float top = p00 + dx * (p10 - p00);
+          float bottom = p01 + dx * (p11 - p01);
+          float val = top + dy * (bottom - top);
+
+          // Kodis A8R8G8B8 erwartet B-G-R-A Reihenfolge im Speicher
+          if (c == 0) dst[2] = static_cast<uint8_t>(val); // R
+          if (c == 1) dst[1] = static_cast<uint8_t>(val); // G
+          if (c == 2) dst[0] = static_cast<uint8_t>(val); // B
+        }
+        dst[3] = 0xff; // Alpha voll deckend
+      }
+    }
+
     ++image;
   }
 
